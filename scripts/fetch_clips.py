@@ -124,6 +124,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 
 # Allow running the script directly from the repository root.
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -839,19 +840,30 @@ def _loads_tolerant(text: str) -> list[dict]:
 _CLIENT = None
 _TOKEN_LOCK = threading.Lock()
 
+# A ranking call carries twenty sheets and can legitimately think for a while,
+# but the SDK sets no request timeout at all: a half-closed socket left one
+# unattended plan run blocked for 38 minutes at 0% CPU with no output. Bound
+# the wait and retry, because losing one call is cheaper than losing the run.
+GEMINI_TIMEOUT_MS = 240_000
+GEMINI_ATTEMPTS = 3
+
 
 def _gemini_client():
     """One shared client: verification fans out over threads."""
     global _CLIENT
     if _CLIENT is None:
         from google import genai
+        from google.genai import types
 
         from app.config import config
 
         api_key = config.app.get("gemini_api_key", "")
         if not api_key:
             sys.exit("error: gemini_api_key is not set in config.toml")
-        _CLIENT = genai.Client(api_key=api_key)
+        _CLIENT = genai.Client(
+            api_key=api_key,
+            http_options=types.HttpOptions(timeout=GEMINI_TIMEOUT_MS),
+        )
     return _CLIENT
 
 
@@ -890,16 +902,29 @@ def _gemini_parts_json(
     from google.genai import types
 
     client = _gemini_client()
-    resp = client.models.generate_content(
-        model=model,
-        contents=types.Content(parts=parts),
-        config=types.GenerateContentConfig(
-            temperature=temperature,
-            response_mime_type="application/json",
-            max_output_tokens=_MAX_OUTPUT_TOKENS,
-            thinking_config=_thinking_config(model, thinking),
-        ),
-    )
+    resp = None
+    for attempt in range(1, GEMINI_ATTEMPTS + 1):
+        try:
+            resp = client.models.generate_content(
+                model=model,
+                contents=types.Content(parts=parts),
+                config=types.GenerateContentConfig(
+                    temperature=temperature,
+                    response_mime_type="application/json",
+                    max_output_tokens=_MAX_OUTPUT_TOKENS,
+                    thinking_config=_thinking_config(model, thinking),
+                ),
+            )
+            break
+        except Exception as exc:  # transport errors, timeouts, transient 5xx
+            if attempt == GEMINI_ATTEMPTS:
+                raise
+            if not quiet:
+                print(
+                    f"  [retry] {type(exc).__name__} on attempt {attempt}/"
+                    f"{GEMINI_ATTEMPTS}: {str(exc)[:120]}"
+                )
+            time.sleep(2 * attempt)
 
     usage = getattr(resp, "usage_metadata", None)
     if usage:
