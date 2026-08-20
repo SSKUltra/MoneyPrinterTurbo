@@ -1211,6 +1211,8 @@ def fill_beat_budget(
     min_score: int,
     exclude: set | None = None,
     want_coverage: bool = True,
+    global_uses: dict | None = None,
+    max_shot_reuse: int = 2,
 ) -> tuple[list[dict], float]:
     """Choose clips for one beat from a pool ranked across several sources.
 
@@ -1223,27 +1225,43 @@ def fill_beat_budget(
     - drop anything under ``min_score``
     - cap the seconds any one source may contribute, so a long trap source
       cannot own a beat merely by being long
+    - prefer shots no earlier beat has used, and never exceed
+      ``max_shot_reuse`` uses of one shot across the whole video unless the
+      beat would otherwise ship short
     - with ``want_coverage``, seed the beat with the best candidate for each
       wanted shot before filling by score, so a beat is not five near-identical
       drive-bys
+
+    Beats are ranked one at a time, so without ``global_uses`` the same strong
+    shot wins in every beat that asks for a similar image: one pour shot took
+    eight of the twenty-five beats on the whisky benchmark, and 58 unique shots
+    were stretched over 530s. Preferring unused shots spends the pool the
+    ranking calls already paid for.
 
     Returns the chosen candidates and their total seconds; a total under
     ``need_seconds`` is an honest shortfall, never something to paper over.
     """
     exclude = exclude or set()
+    uses = global_uses if global_uses is not None else {}
     pool = [
         c for c in candidates if c["score"] >= min_score and c["key"] not in exclude
     ]
-    ordered = sorted(pool, key=lambda c: (-c["score"], c["order"]))
+    # Fresh shots sort ahead of already-spent ones, then by the model's score.
+    ordered = sorted(
+        pool,
+        key=lambda c: (min(uses.get(c["key"], 0), max_shot_reuse), -c["score"], c["order"]),
+    )
 
     chosen: list[dict] = []
     taken: set = set()
     per_source: dict[str, float] = {}
     total = 0.0
 
-    def take(cand) -> bool:
+    def take(cand, reuse_limit: int) -> bool:
         nonlocal total
         if cand["key"] in taken:
+            return False
+        if uses.get(cand["key"], 0) >= reuse_limit:
             return False
         used = per_source.get(cand["src_id"], 0.0)
         if used + cand["seconds"] > per_source_seconds + 0.001:
@@ -1254,18 +1272,26 @@ def fill_beat_budget(
         total += cand["seconds"]
         return True
 
-    if want_coverage:
-        for want_number in sorted({c["want_number"] for c in ordered}):
+    # Pass 1 spends only unused shots; pass 2 reopens the ones already seen.
+    # The last pass drops the cap entirely, because a beat that ships short
+    # desynchronises every beat after it and that costs more than a repeated
+    # image: this rule may never fill a beat less than it would have unfilled.
+    for reuse_limit in (1, max(1, max_shot_reuse), sys.maxsize):
+        if want_coverage:
+            for want_number in sorted({c["want_number"] for c in ordered}):
+                if total >= need_seconds:
+                    break
+                for cand in ordered:
+                    if cand["want_number"] == want_number and take(cand, reuse_limit):
+                        break
+
+        for cand in ordered:
             if total >= need_seconds:
                 break
-            for cand in ordered:
-                if cand["want_number"] == want_number and take(cand):
-                    break
+            take(cand, reuse_limit)
 
-    for cand in ordered:
         if total >= need_seconds:
             break
-        take(cand)
 
     chosen.sort(key=lambda c: (c["want_number"], -c["score"], c["order"]))
     return chosen, total
@@ -2212,8 +2238,11 @@ def verify_candidates(cands: list[dict], beat: dict, groups: list[dict], args) -
     return out
 
 
-def run_beat(beat: dict, plan: dict, args, is_last: bool = False) -> dict:
+def run_beat(
+    beat: dict, plan: dict, args, is_last: bool = False, global_uses: dict | None = None
+) -> dict:
     """Stages 1-4 for one beat."""
+    global_uses = global_uses if global_uses is not None else {}
     need = float(beat["need"])
     print(f"\n=== beat {beat['tag']}: {beat['subject']} needs {need:.2f}s ===")
     groups = beat_groups(beat, plan, args)
@@ -2319,6 +2348,8 @@ def run_beat(beat: dict, plan: dict, args, is_last: bool = False) -> dict:
                 args.min_score,
                 exclude=rejected,
                 want_coverage=not args.no_want_coverage,
+                global_uses=global_uses,
+                max_shot_reuse=args.max_shot_reuse,
             )
             used = (source_cap, shot_cap)
             if total >= need - DURATION_SAFETY_MARGIN:
@@ -2404,6 +2435,8 @@ def run_beat(beat: dict, plan: dict, args, is_last: bool = False) -> dict:
             used[0],
             args.min_score,
             want_coverage=not args.no_want_coverage,
+            global_uses=global_uses,
+            max_shot_reuse=args.max_shot_reuse,
         )
     total = sum(c["seconds"] for c in kept)
     # Only the final beat may run long: nothing follows it to push out of sync,
@@ -2416,6 +2449,10 @@ def run_beat(beat: dict, plan: dict, args, is_last: bool = False) -> dict:
     result["per_source_cap"] = round(used[0], 2)
     result["per_shot_cap"] = round(used[1], 2)
     result["verified"] = len(verdicts)
+    # Book the shipped shots against the whole video, so later beats reach for
+    # footage this one did not already spend.
+    for clip in kept:
+        global_uses[clip["key"]] = global_uses.get(clip["key"], 0) + 1
     result["clips"] = [
         {k: v for k, v in c.items() if k not in ("key", "vkey", "span")} for c in kept
     ]
@@ -2437,8 +2474,17 @@ def run_beat(beat: dict, plan: dict, args, is_last: bool = False) -> dict:
 
 def select_beats(plan: dict, args) -> dict:
     """Run the whole pipeline over every beat and write the selection."""
+    # One tally for the whole video: beats are ranked in isolation, so without
+    # it the strongest shot wins in every beat that asks for a similar image.
+    global_uses: dict = {}
     beats = [
-        run_beat(beat, plan, args, is_last=(n == len(plan["beats"]) - 1))
+        run_beat(
+            beat,
+            plan,
+            args,
+            is_last=(n == len(plan["beats"]) - 1),
+            global_uses=global_uses,
+        )
         for n, beat in enumerate(plan["beats"])
     ]
     selection = {
@@ -2749,6 +2795,14 @@ def main() -> None:
         type=int,
         default=3,
         help="drop ranked candidates scoring below this 1-5 value (default: 3)",
+    )
+    parser.add_argument(
+        "--max-shot-reuse",
+        type=int,
+        default=2,
+        help="most beats one shot may appear in across the whole video; beats "
+        "prefer shots no earlier beat used and only reuse to avoid shipping "
+        "short (default: 2)",
     )
     parser.add_argument(
         "--pool-seconds",
